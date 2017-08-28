@@ -49,8 +49,14 @@
 #include <string.h>
 #include <assert.h>
 
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "galois.h"
 #include "jerasure.h"
+#include <infiniband/verbs_exp.h>
 
 #define talloc(type, num) (type *) malloc(sizeof(type)*(num))
 
@@ -305,19 +311,460 @@ int *jerasure_matrix_to_bitmatrix(int k, int m, int w, int *matrix)
   return bitmatrix;
 }
 
+#define err_log     dprintf
+#define info_log    dprintf
+int g_fd;
+
+#if 0
+struct ibv_device *
+find_device(const char *devname)
+{
+    struct ibv_device **dev_list = NULL;
+    struct ibv_device *device = NULL;
+
+    dev_list = ibv_get_device_list(NULL);
+    if (!dev_list) {
+        err_log(g_fd, "Failed to get IB devices list.\n");
+        return NULL;
+    }
+
+    device = calloc(1, sizeof(struct ibv_device));
+    if (!device) {
+        err_log(g_fd, "failed to allocate ibv_device\n");
+        return NULL;
+    }
+
+    if (!devname) {
+        if (!*dev_list)
+            err_log(g_fd, "No IB devices found\n");
+       memcpy(device, &(*dev_list), sizeof(*device));
+     /* remove */
+        int i;
+        for (i = 0; dev_list[i]; ++i)
+            err_log(g_fd, "i=%d, dev name %s\n", i, ibv_get_device_name(dev_list[i]));
+       err_log(g_fd, "device name %s name %s\n", device->name, ibv_get_device_name(device));
+
+     /*end of remove*/
+    } else {
+        int i;
+
+        for (i = 0; dev_list[i]; ++i)
+            if (!strcmp(ibv_get_device_name(dev_list[i]),
+                    devname))
+                break;
+
+        memcpy(device, &(dev_list[i]), sizeof(*device)); 
+        if (!device)
+            err_log(g_fd, "IB device %s not found\n", devname);
+    }
+
+    ibv_free_device_list(dev_list);
+
+    return device;
+}
+#endif
+
+struct ibv_device *
+find_device(const char *devname)
+{
+    struct ibv_device **dev_list = NULL;
+    struct ibv_device *device = NULL;
+
+    dev_list = ibv_get_device_list(NULL);
+    if (!dev_list) {
+        err_log(g_fd, "Failed to get IB devices list.\n");
+        return NULL;
+    }
+
+    if (!devname) {
+        device = dev_list[0];
+        if (!device)
+            err_log(g_fd, "No IB devices found\n");
+    } else {
+        int i;
+
+        for (i = 0; dev_list[i]; ++i)
+            if (!strcmp(ibv_get_device_name(dev_list[i]),
+                    devname))
+                break;
+
+        device = dev_list[i];
+        if (!device)
+            err_log(g_fd, "IB device %s not found\n", devname);
+    }
+
+    ibv_free_device_list(dev_list);
+
+    return device;
+}
+
+struct ec_mr {
+    /* to hold number of mrs */
+    unsigned  int        num_mrs;
+    struct ibv_mr        **mr;
+    struct ibv_sge       *sge;
+};
+
+struct ec_context {
+    struct ibv_context               *context;
+    struct ibv_pd                    *pd;
+    struct ibv_exp_ec_calc           *calc;
+    struct ibv_exp_ec_calc_init_attr attr;
+    int                              block_size;
+    struct ec_mr                     data;
+    struct ec_mr                     code;
+    /*struct ec_mr                     udata;*/
+    struct ibv_exp_ec_mem            mem;
+    /*struct ibv_exp_ec_mem            umem;
+    uint8_t                          *en_mat;
+    uint8_t                          *de_mat;
+    int                              *encode_matrix;
+    int                              *erasures_arr;
+    uint8_t                          *data_updates_arr;
+    uint8_t                          *code_updates_arr;
+    uint8_t                          *erasures;
+    int                              *survived_arr;
+    uint8_t                          *survived;
+    int                              num_data_updates;
+    int                              num_code_updates;
+    char                             **jerasure_src;
+    char                             **jerasure_dst;*/
+};
+
+struct encoder_context {
+    struct ibv_context  *context;
+    struct ibv_pd       *pd;
+    struct ec_context   *ec_ctx;
+};
+
+struct inargs {
+    char    *devname;
+    int     k;
+    int     m;
+    int     w;
+    int     *matrix;
+    int     size;
+};
+
+static int
+ec_get_sg(struct ec_mr *data,
+          struct ibv_pd *pd,
+          int sge_size,
+          int block_size,
+          char **data_ptrs)
+{
+    int i, j;
+
+    data->num_mrs = 0;
+    data->mr = calloc(sge_size, sizeof(struct ibv_mr *));
+/*    data->mr = talloc(struct ibv_mr *, sge_size);*/
+    if (!data->mr) {
+        err_log(g_fd, "Failed to allocate data MRs \n");
+        goto fail;
+    }
+    for (i = 0; i < sge_size; i++) {
+        /* register each block separately */
+      *(data->mr + i) = ibv_reg_mr(pd, *(data_ptrs + i), block_size, IBV_ACCESS_LOCAL_WRITE);
+      if (!*(data->mr + i)) {
+         err_log(g_fd, "Failed to allocate data MR for i=%d\n", i);
+         goto dereg_mr;
+      }
+      /* count number of registered mrs */
+      data->num_mrs ++;
+    }
+
+    data->sge = calloc(sge_size, sizeof(*data->sge));
+    if (!data->sge) {
+        err_log(g_fd, "Failed to allocate data sges\n");
+        goto dereg_mr;
+    }
+
+    for (i = 0; i < sge_size; i++) {
+        data->sge[i].lkey = (*(data->mr + i))->lkey;
+        data->sge[i].addr = (uintptr_t)*(data_ptrs + i);
+        data->sge[i].length = block_size;
+    }
+
+    return 0;
+
+dereg_mr:
+  for (j = 0; j < i; j++) 
+    ibv_dereg_mr(*(data->mr + j));
+fail:
+    return -ENOMEM;
+}
+
+static int
+alloc_ec_mrs(struct ec_context *ctx, char **data_ptrs, char **code_ptrs)
+{
+    int err, i;
+
+    err = ec_get_sg(&ctx->data, ctx->pd, ctx->attr.k, ctx->block_size, data_ptrs);
+    if (err)
+        return err;
+
+    err = ec_get_sg(&ctx->code, ctx->pd, ctx->attr.m, ctx->block_size, code_ptrs);
+    if (err)
+        goto free_dbuf;
+
+
+    ctx->mem.data_blocks = ctx->data.sge;
+    ctx->mem.num_data_sge = ctx->attr.k;
+    ctx->mem.code_blocks = ctx->code.sge;
+    ctx->mem.num_code_sge = ctx->attr.m;
+    ctx->mem.block_size = ctx->block_size;
+
+    return 0;
+
+free_dbuf:
+    for (i = 0; i < ctx->data.num_mrs; i++)
+        ibv_dereg_mr(*(ctx->data.mr + i));
+    free(ctx->data.sge);
+
+    return err;
+}
+
+static void free_ec_mr(struct ec_mr *e_mr)
+{
+    int i;
+
+    free(e_mr->sge);
+    for (i = 0; i < e_mr->num_mrs; i++)
+        ibv_dereg_mr(*(e_mr->mr + i));
+    e_mr->num_mrs = 0;
+}
+
+static void
+free_ec_mrs(struct ec_context *ctx)
+{
+
+    free_ec_mr(&ctx->code);
+    free_ec_mr(&ctx->data);
+}
+
+void free_ec_ctx(struct ec_context *ctx)
+{
+/*    ibv_exp_dealloc_ec_calc(ctx->calc);*/
+    free_ec_mrs(ctx);
+    /*free(ctx->encode_matrix);
+    free(ctx->attr.encode_matrix);*/
+    free(ctx);
+}
+
+static int alloc_encode_matrix(int k, int m, int w, int *rs_mat, uint8_t **en_mat)
+{
+    uint8_t *matrix;
+    int i, j;
+
+    matrix = calloc(1, m * k);
+    if (!matrix) {
+        err_log(g_fd, "Failed to allocate encode matrix\n");
+        return -ENOMEM;
+    }
+
+    for (i = 0; i < m; i++)
+        for (j = 0; j < k; j++)
+            matrix[j*m+i] = (uint8_t)rs_mat[i*k+j];
+
+    *en_mat = matrix;
+
+    return 0;
+}
+
+struct ec_context *
+alloc_ec_ctx(struct ibv_pd *pd, struct inargs *in, char **data_ptrs, char **code_ptrs)
+{
+    struct ec_context *ctx;
+    struct ibv_exp_device_attr dattr;
+    int err;
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        err_log(g_fd, "Failed to allocate EC context\n");
+        return NULL;
+    }
+
+    ctx->pd = pd;
+    ctx->context = pd->context;
+
+    memset(&dattr, 0, sizeof(dattr));
+    dattr.comp_mask = IBV_EXP_DEVICE_ATTR_EXP_CAP_FLAGS |
+                      IBV_EXP_DEVICE_ATTR_EC_CAPS |
+                      IBV_EXP_DEVICE_ATTR_EC_GF_BASE;
+    err = ibv_exp_query_device(ctx->context, &dattr);
+    if (err) {
+        err_log(g_fd, "Couldn't query device for EC offload caps. err = %d\n", err);
+        goto free_ctx;
+    }
+
+    if (!(dattr.exp_device_cap_flags & IBV_EXP_DEVICE_EC_OFFLOAD)) {
+        err_log(g_fd, "EC offload not supported by driver.\n");
+        goto free_ctx;
+    }
+
+    if (!(dattr.ec_w_mask & (1 << (in->w - 1)))) {
+        err_log(g_fd, "W(%d) not supported for given device(%s)\n",
+                in->w, ctx->context->device->name);
+        goto free_ctx;
+    }
+
+    info_log(g_fd, "EC offload supported by driver.\n");
+    info_log(g_fd, "max_ec_calc_inflight_calcs %d\n", dattr.ec_caps.max_ec_calc_inflight_calcs);
+    info_log(g_fd, "max_data_vector_count %d\n", dattr.ec_caps.max_ec_data_vector_count);
+
+    ctx->attr.comp_mask = IBV_EXP_EC_CALC_ATTR_MAX_INFLIGHT |
+            IBV_EXP_EC_CALC_ATTR_K |
+            IBV_EXP_EC_CALC_ATTR_M |
+            IBV_EXP_EC_CALC_ATTR_W |
+            IBV_EXP_EC_CALC_ATTR_MAX_DATA_SGE |
+            IBV_EXP_EC_CALC_ATTR_MAX_CODE_SGE |
+            IBV_EXP_EC_CALC_ATTR_ENCODE_MAT |
+            IBV_EXP_EC_CALC_ATTR_AFFINITY |
+            IBV_EXP_EC_CALC_ATTR_POLLING;
+    ctx->attr.max_inflight_calcs = 1;
+    ctx->attr.k = in->k;
+    ctx->attr.m = in->m;
+    ctx->attr.w = in->w;
+    ctx->attr.max_data_sge = in->k;
+    ctx->attr.max_code_sge = in->m;
+   /* ctx->attr.encode_matrix = (uint8_t*)in->matrix;*/
+    ctx->attr.affinity_hint = 0;
+    ctx->block_size = in->size;
+
+    err = alloc_ec_mrs(ctx, data_ptrs, code_ptrs);
+    err_log(g_fd, "after alloc_ec_mrs err %d\n", err);
+    if (err)
+        goto free_mrs;
+    err = alloc_encode_matrix(ctx->attr.k, ctx->attr.m,
+                              ctx->attr.w, in->matrix, &ctx->attr.encode_matrix);
+    if (err)
+        goto free_mrs;
+
+    ctx->calc = ibv_exp_alloc_ec_calc(ctx->pd, &ctx->attr);
+    err_log(g_fd, "after ibv_exp_alloc_ec_calc\n");
+    if (!ctx->calc) {
+        err_log(g_fd, "Failed to allocate EC calc\n");
+        goto free_mrs;
+    }
+    
+    return ctx;
+
+free_mrs:
+    free_ec_mrs(ctx);
+free_ctx:
+    free(ctx);
+
+    return NULL;
+}
+
+static struct encoder_context *
+init_ctx(struct ibv_device *ib_dev, struct inargs *in, char **data_ptrs, char **code_ptrs)
+{
+    struct encoder_context *ctx;
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        err_log(g_fd, "Failed to allocate encoder context\n");
+        return NULL;
+    }
+
+    ctx->context = ibv_open_device(ib_dev);
+    if (!ctx->context) {
+        err_log(g_fd, "Couldn't get context for %s\n",
+            ibv_get_device_name(ib_dev));
+        goto free_ctx;
+    }
+    ctx->pd = ibv_alloc_pd(ctx->context);
+    if (!ctx->pd) {
+        err_log(g_fd, "Failed to allocate PD\n");
+        goto close_device;
+    }
+
+    ctx->ec_ctx = alloc_ec_ctx(ctx->pd, in, data_ptrs, code_ptrs);
+    if (!ctx->ec_ctx) {
+        err_log(g_fd, "Failed to allocate EC context\n");
+        goto dealloc_pd;
+    }
+
+    return ctx;
+
+dealloc_pd:
+    ibv_dealloc_pd(ctx->pd);
+close_device:
+    ibv_close_device(ctx->context);
+free_ctx:
+    free(ctx);
+
+    return NULL;
+}
+
+static void
+close_ctx(struct encoder_context *ctx)
+{
+    free_ec_ctx(ctx->ec_ctx);
+    ibv_dealloc_pd(ctx->pd);
+
+    if (ibv_close_device(ctx->context))
+        err_log(g_fd, "Couldn't release context\n");
+
+
+    free(ctx);
+}
+
 void jerasure_matrix_encode(int k, int m, int w, int *matrix,
                           char **data_ptrs, char **coding_ptrs, int size)
 {
-  int i;
-  
+  struct ibv_device *device;
+  struct encoder_context *ctx;
+  struct inargs in;
+  int err, i;
+
+  g_fd = open("/tmp/debug_ceph.jul", O_RDWR | O_CREAT , 0666);
+  if (g_fd < 0) {
+    fprintf(stderr, "ERROR: failed to open file\n");
+    goto old;
+  }
+ 
   if (w != 8 && w != 16 && w != 32) {
-    fprintf(stderr, "ERROR: jerasure_matrix_encode() and w is not 8, 16 or 32\n");
+    dprintf(g_fd, "ERROR: jerasure_matrix_encode() and w is not 8, 16 or 32\n");
     assert(0);
   }
 
+  dprintf(g_fd, "In\n");
+  device = find_device(NULL);
+  if (!device) {
+    dprintf(g_fd, "ERROR: jerasure_matrix_encode() didn't find device\n");
+    assert(0);
+  }
+  dprintf(g_fd, "Device name %s (name %s), dev_name %s, dev_path %s, ibdev_path %s \n", device->name, ibv_get_device_name(device),
+  device->dev_name, device->dev_path, device->ibdev_path);
+  in.k = k;
+  in.m = m;
+  in.w = w;
+  in.matrix = matrix;
+  in.size = size;
+
+  ctx = init_ctx(device, &in, data_ptrs, coding_ptrs);
+  if (!ctx) {
+    err_log(g_fd, "init_ctx failed, retreating to old code.\n");
+    goto old;
+  }
+  err_log(g_fd, "after init_ctx.\n");
+
+  err = ibv_exp_ec_encode_sync(ctx->ec_ctx->calc, &(ctx->ec_ctx->mem));
+  if (err)
+    err_log(g_fd, "Failed ibv_exp_ec_encode (%d)\n", err);
+ 
+  err_log(g_fd, "after encode.\n");
+  close_ctx(ctx);
+  close(g_fd);
+  return;
+
+old:
   for (i = 0; i < m; i++) {
     jerasure_matrix_dotprod(k, w, matrix+(i*k), NULL, k+i, data_ptrs, coding_ptrs, size);
   }
+  close(g_fd);
 }
 
 void jerasure_bitmatrix_dotprod(int k, int w, int *bitmatrix_row,
