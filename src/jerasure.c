@@ -607,6 +607,7 @@ static void init()
   struct ibv_exp_device_attr dattr;
   int err;
 
+  dprintf(g_fd, "In init.\n");
   g_offload_init_status = INIT_FAILED;
 
   struct ibv_device *device;
@@ -724,6 +725,7 @@ void jerasure_matrix_encode(int k, int m, int w, int *matrix,
       err_log(g_fd, "Failed to allocate EC context, retreating to old code\n");
       goto old;
   }
+  err_log(g_fd, "After alloc_ec_ctx, before ibv_exp_ec_encode_sync\n");
 
   err = ibv_exp_ec_encode_sync(g_ctx->ec_ctx->calc, &(g_ctx->ec_ctx->mem));
   if (err)
@@ -731,14 +733,15 @@ void jerasure_matrix_encode(int k, int m, int w, int *matrix,
  
   err_log(g_fd, "after encode.\n");
   free_ec_ctx(g_ctx->ec_ctx);
-  close(g_fd);
-  return;
+  goto close;
 
 old:
   for (i = 0; i < m; i++) {
     jerasure_matrix_dotprod(k, w, matrix+(i*k), NULL, k+i, data_ptrs, coding_ptrs, size);
   }
+close:
   close(g_fd);
+  err_log(g_fd, "after close g_fd.\n");
 }
 
 void jerasure_bitmatrix_dotprod(int k, int w, int *bitmatrix_row,
