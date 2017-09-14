@@ -57,6 +57,7 @@
 #include "galois.h"
 #include "jerasure.h"
 #include <infiniband/verbs_exp.h>
+#include <sys/syscall.h>
 
 #define talloc(type, num) (type *) malloc(sizeof(type)*(num))
 
@@ -344,7 +345,7 @@ find_device(const char *devname)
             err_log(g_fd, "IB device %s not found\n", devname);
     }
 
-    ibv_free_device_list(dev_list);
+/*    ibv_free_device_list(dev_list);*/
 
     return device;
 }
@@ -359,6 +360,7 @@ struct ec_context {
     struct ibv_sge                   *code_sge;
     struct ibv_exp_ec_mem            mem;
 };
+
 typedef enum InitEC_status
 {
   NOT_INITIALIZED = 0,
@@ -435,7 +437,7 @@ alloc_ec_mrs(struct ec_context *ctx, char **data_ptrs, char **code_ptrs)
   ctx->mem.code_blocks = ctx->code_sge;
   ctx->mem.num_code_sge = ctx->attr.m;
   ctx->mem.block_size = ctx->block_size;
-
+  
   return 0;
 
 free_dbuf:
@@ -602,10 +604,23 @@ close_ctx(struct encoder_context *ctx)
 }
 
 #define ULLONG_MAX 0xFFFFFFFFFFFFFFFF
-static void init()
+void __attribute__ ((constructor (65535) )) init()
 {
   struct ibv_exp_device_attr dattr;
   int err;
+
+  char fname[100] ={'\0'};
+  pid_t pid, tid;
+
+  pid = getpid();
+  tid = syscall(SYS_gettid);
+
+  sprintf(fname, "/tmp/debug_ceph.jul_%d_%d", (int)pid, (int)tid);
+
+  g_fd = open(fname, O_RDWR | O_CREAT | O_APPEND , 0666);
+  if (g_fd < 0) {
+    fprintf(stderr, "ERROR: failed to open file\n");
+  }
 
   dprintf(g_fd, "In init.\n");
   g_offload_init_status = INIT_FAILED;
@@ -613,9 +628,10 @@ static void init()
   struct ibv_device *device;
   device = find_device(NULL);
   if (!device) {
-    dprintf(g_fd, "ERROR: jerasure_matrix_encode() didn't find device\n");
+    dprintf(g_fd, "ERROR: init didn't find device\n");
     assert(0);
   }
+  err_log(g_fd, "device %s\n", ibv_get_device_name(device));
 
   g_ctx = calloc(1, sizeof(*g_ctx));
   if (!g_ctx) {
@@ -685,28 +701,24 @@ void jerasure_matrix_encode(int k, int m, int w, int *matrix,
 {
   struct inargs in;
   int err, i;
- 
+
+  fprintf(stderr, "jerasure_matrix_encode in\n"); 
   if (w != 8 && w != 16 && w != 32) {
-    dprintf(g_fd, "ERROR: jerasure_matrix_encode() and w is not 8, 16 or 32\n");
+    fprintf(stderr, "ERROR: jerasure_matrix_encode() and w is not 8, 16 or 32\n");
     assert(0);
   }
 
-  g_fd = open("/tmp/debug_ceph.jul", O_RDWR | O_CREAT , 0666);
-  if (g_fd < 0) {
-    fprintf(stderr, "ERROR: failed to open file\n");
-    goto old;
-  }
-
-  if (g_offload_init_status == NOT_INITIALIZED) {
-    dprintf(g_fd, "In jerasure_matrix_encode, NOT_INITIALIZED\n");
+  /*if (g_offload_init_status == NOT_INITIALIZED) {
+    fprintf(stderr, "In jerasure_matrix_encode, NOT_INITIALIZED\n");
     init();
-  }
+  }*/
   
   if (g_offload_init_status == INIT_FAILED) {
-    dprintf(g_fd, "In jerasure_matrix_encode, INIT_FAILED\n");
+    fprintf(stderr, "In jerasure_matrix_encode, INIT_FAILED\n");
     goto old;
   }
 
+  fprintf(stderr, "jerasure_matrix_encode g_ctx->mr %p\n", g_ctx->mr); 
   if (!(g_ctx->ec_w_mask & (1 << (w - 1)))) {
       err_log(g_fd, "W(%d) not supported for given device(%s)\n",
 	      w, ibv_get_device_name(g_ctx->context->device));
