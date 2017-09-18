@@ -58,6 +58,7 @@
 #include "jerasure.h"
 #include <infiniband/verbs_exp.h>
 #include <sys/syscall.h>
+#include <pthread.h>
 
 #define talloc(type, num) (type *) malloc(sizeof(type)*(num))
 
@@ -525,6 +526,8 @@ alloc_ec_ctx(struct ibv_pd *pd, struct inargs *in, char **data_ptrs, char **code
     ctx->attr.affinity_hint = 0;
     ctx->block_size = in->size;
 
+    err_log(g_fd, "block_size=%d\n", ctx->block_size);
+
     err = alloc_ec_mrs(ctx, data_ptrs, code_ptrs);
     err_log(g_fd, "after alloc_ec_mrs err %d\n", err);
     if (err)
@@ -604,7 +607,9 @@ close_ctx(struct encoder_context *ctx)
 }
 
 #define ULLONG_MAX 0xFFFFFFFFFFFFFFFF
-void __attribute__ ((constructor (65535) )) init()
+pthread_once_t once_control = PTHREAD_ONCE_INIT;
+
+void init()
 {
   struct ibv_exp_device_attr dattr;
   int err;
@@ -708,6 +713,12 @@ void jerasure_matrix_encode(int k, int m, int w, int *matrix,
     assert(0);
   }
 
+  fprintf(stderr, "jerasure_matrix_encode: before pthread_once \n");
+  pthread_once(&once_control, init);
+
+  while (g_offload_init_status == NOT_INITIALIZED) {
+    sleep(1);
+  }
   /*if (g_offload_init_status == NOT_INITIALIZED) {
     fprintf(stderr, "In jerasure_matrix_encode, NOT_INITIALIZED\n");
     init();
@@ -752,8 +763,7 @@ old:
     jerasure_matrix_dotprod(k, w, matrix+(i*k), NULL, k+i, data_ptrs, coding_ptrs, size);
   }
 close:
-  close(g_fd);
-  err_log(g_fd, "after close g_fd.\n");
+  err_log(g_fd, "jerasure_matrix_encode: Out.\n");
 }
 
 void jerasure_bitmatrix_dotprod(int k, int w, int *bitmatrix_row,
