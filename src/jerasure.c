@@ -373,6 +373,9 @@ struct encoder_context {
   struct ibv_context  *context;
   struct ibv_pd       *pd;
   struct ec_context   *ec_ctx;
+  unsigned int        cnt1;
+  struct ec_context   *ec_ctx2;
+  unsigned int        cnt2;
   /* one global key */
   struct ibv_mr       *mr;
   /* w that device supports */
@@ -494,6 +497,59 @@ static int alloc_encode_matrix(int k, int m, int w, int *rs_mat, uint8_t **en_ma
 }
 
 struct ec_context *
+alloc_ec_ctx2(struct ibv_pd *pd, struct inargs *in)
+{
+    struct ec_context *ctx;
+    int err;
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        err_log(g_fd, "Failed to allocate EC context\n");
+        return NULL;
+    }
+
+    ctx->pd = pd;
+    ctx->context = pd->context;
+
+    ctx->attr.comp_mask = IBV_EXP_EC_CALC_ATTR_MAX_INFLIGHT |
+            IBV_EXP_EC_CALC_ATTR_K |
+            IBV_EXP_EC_CALC_ATTR_M |
+            IBV_EXP_EC_CALC_ATTR_W |
+            IBV_EXP_EC_CALC_ATTR_MAX_DATA_SGE |
+            IBV_EXP_EC_CALC_ATTR_MAX_CODE_SGE |
+            IBV_EXP_EC_CALC_ATTR_ENCODE_MAT |
+            IBV_EXP_EC_CALC_ATTR_AFFINITY |
+            IBV_EXP_EC_CALC_ATTR_POLLING;
+    ctx->attr.max_inflight_calcs = 1;
+    ctx->attr.k = in->k;
+    ctx->attr.m = in->m;
+    ctx->attr.w = in->w;
+    ctx->attr.max_data_sge = in->k;
+    ctx->attr.max_code_sge = in->m;
+    ctx->attr.affinity_hint = 0;
+    ctx->block_size = in->size;
+
+    err = alloc_encode_matrix(ctx->attr.k, ctx->attr.m,
+                              ctx->attr.w, in->matrix, &ctx->attr.encode_matrix);
+    if (err)
+        goto free_mrs;
+
+    ctx->calc = ibv_exp_alloc_ec_calc(ctx->pd, &ctx->attr);
+
+    if (!ctx->calc) {
+        err_log(g_fd, "Failed to allocate EC calc\n");
+        goto free_mrs;
+    }
+    
+    return ctx;
+
+free_mrs:
+    free(ctx);
+
+    return NULL;
+}
+
+struct ec_context *
 alloc_ec_ctx(struct ibv_pd *pd, struct inargs *in, char **data_ptrs, char **code_ptrs)
 {
     struct ec_context *ctx;
@@ -539,6 +595,7 @@ alloc_ec_ctx(struct ibv_pd *pd, struct inargs *in, char **data_ptrs, char **code
 
     ctx->calc = ibv_exp_alloc_ec_calc(ctx->pd, &ctx->attr);
     err_log(g_fd, "after ibv_exp_alloc_ec_calc\n");
+
     if (!ctx->calc) {
         err_log(g_fd, "Failed to allocate EC calc\n");
         goto free_mrs;
@@ -551,6 +608,19 @@ free_mrs:
     free(ctx);
 
     return NULL;
+}
+
+void update_ec_ctx(struct ec_context *ctx, char **data_ptrs, char **coding_ptrs)
+{
+  int i;
+
+  for (i=0; i < ctx->attr.k; i++) {
+    ctx->data_sge[i].addr = (uintptr_t)*(data_ptrs + i);
+  }
+  for (i=0; i < ctx->attr.m; i++) {
+    ctx->code_sge[i].addr = (uintptr_t)*(coding_ptrs + i);
+  }
+
 }
 
 static struct encoder_context *
@@ -593,23 +663,23 @@ free_ctx:
     return NULL;
 }
 
-static void
-close_ctx(struct encoder_context *ctx)
+void __attribute__ ((destructor)) fini()
 {
-    free_ec_ctx(ctx->ec_ctx);
-    ibv_dealloc_pd(ctx->pd);
+  if (g_offload_init_status != INIT_SUCCESS)
+    return;
+  free_ec_ctx(g_ctx->ec_ctx);
+  ibv_dealloc_pd(g_ctx->pd);
 
-    if (ibv_close_device(ctx->context))
-        err_log(g_fd, "Couldn't release context\n");
+  if (ibv_close_device(g_ctx->context))
+      err_log(g_fd, "Couldn't release context\n");
 
-
-    free(ctx);
+  free(g_ctx);
+  err_log(g_fd, "fini: out\n");
+  close(g_fd);
 }
 
 #define ULLONG_MAX 0xFFFFFFFFFFFFFFFF
-pthread_once_t once_control = PTHREAD_ONCE_INIT;
-
-void init()
+void __attribute__ ((constructor)) init()
 {
   struct ibv_exp_device_attr dattr;
   int err;
@@ -691,71 +761,147 @@ void init()
     err_log(g_fd, "Failed to allocate data MR\n");
     goto close_device;
   }
+  /* k=2, m=1, w=8 */
+  int *rs_mat; /*reed_sol_vandermonde_coding_matrix(2, 1, 8);*/
+  rs_mat = talloc(int, 2);
+  if (!rs_mat) {
+    err_log(g_fd, "Failed to alloc matrix\n");
+    goto close_device;
+  }
+  rs_mat[0]=rs_mat[1]=1;
+  struct inargs alloc_in = {};
+
+  alloc_in.k = 2;
+  alloc_in.m = 1;
+  alloc_in.w = 8;
+  alloc_in.matrix = rs_mat;
+
+  g_ctx->ec_ctx = alloc_ec_ctx2(g_ctx->pd, &alloc_in);
+  if (!g_ctx->ec_ctx) {
+    err_log(g_fd, "Failed to allocate EC context.\n");
+    goto close_device;
+  }
+  g_ctx->cnt1 = 0;
+  g_ctx->ec_ctx2 = alloc_ec_ctx2(g_ctx->pd, &alloc_in);
+  if (!g_ctx->ec_ctx2) {
+    err_log(g_fd, "Failed to allocate EC context 2.\n");
+    goto close_device;
+  }
+  g_ctx->cnt2 = 0;
   g_offload_init_status = INIT_SUCCESS;
   return;
 
 close_device:
-    ibv_close_device(g_ctx->context);
+  ibv_close_device(g_ctx->context);
 free_ctx:
   free(g_ctx);
   g_ctx = NULL;
 }
 
+pthread_mutex_t g_mutex;
 void jerasure_matrix_encode(int k, int m, int w, int *matrix,
                           char **data_ptrs, char **coding_ptrs, int size)
 {
-  struct inargs in;
   int err, i;
+  /*pid_t tid;*/
+  struct ec_context *choose_ctx = NULL;
+  int *choose_cnt = NULL;
 
-  fprintf(stderr, "jerasure_matrix_encode in\n"); 
+  /*tid = syscall(SYS_gettid);*/
+
   if (w != 8 && w != 16 && w != 32) {
     fprintf(stderr, "ERROR: jerasure_matrix_encode() and w is not 8, 16 or 32\n");
     assert(0);
   }
 
-  fprintf(stderr, "jerasure_matrix_encode: before pthread_once \n");
-  pthread_once(&once_control, init);
-
-  while (g_offload_init_status == NOT_INITIALIZED) {
-    sleep(1);
-  }
-  /*if (g_offload_init_status == NOT_INITIALIZED) {
-    fprintf(stderr, "In jerasure_matrix_encode, NOT_INITIALIZED\n");
-    init();
-  }*/
-  
   if (g_offload_init_status == INIT_FAILED) {
     fprintf(stderr, "In jerasure_matrix_encode, INIT_FAILED\n");
     goto old;
   }
 
-  fprintf(stderr, "jerasure_matrix_encode g_ctx->mr %p\n", g_ctx->mr); 
   if (!(g_ctx->ec_w_mask & (1 << (w - 1)))) {
       err_log(g_fd, "W(%d) not supported for given device(%s)\n",
 	      w, ibv_get_device_name(g_ctx->context->device));
       goto old;
   }
 
-  in.k = k;
-  in.m = m;
-  in.w = w;
-  in.matrix = matrix;
-  in.size = size;
+  struct ibv_exp_ec_mem mem;
+  struct ibv_sge data_sge[2] = {};
+  struct ibv_sge code_sge[1] = {};
 
-  /* allocate ec context for each calculation */
-  g_ctx->ec_ctx = alloc_ec_ctx(g_ctx->pd, &in, data_ptrs, coding_ptrs);
-  if (!g_ctx->ec_ctx) {
-      err_log(g_fd, "Failed to allocate EC context, retreating to old code\n");
-      goto old;
+  mem.block_size = size;
+
+  mem.num_data_sge = k;
+  /*mem.data_blocks = talloc(struct ibv_sge, k);*/
+  mem.data_blocks = data_sge;
+  for (i = 0; i < k; i++) {
+    /*mem.data_blocks[i].lkey = g_ctx->mr->lkey;
+    mem.data_blocks[i].addr = (uintptr_t)*(data_ptrs + i);
+    mem.data_blocks[i].length = size;*/
+    data_sge[i].lkey = g_ctx->mr->lkey;
+    data_sge[i].addr = (uintptr_t)*(data_ptrs + i);
+    data_sge[i].length = size;
   }
-  err_log(g_fd, "After alloc_ec_ctx, before ibv_exp_ec_encode_sync\n");
+  
 
-  err = ibv_exp_ec_encode_sync(g_ctx->ec_ctx->calc, &(g_ctx->ec_ctx->mem));
+  mem.num_code_sge = m;
+  /*mem.code_blocks = talloc(struct ibv_sge, m);*/
+  mem.code_blocks = code_sge;
+  for (i = 0; i < m; i++) {
+   /*mem.code_blocks[i].lkey = g_ctx->mr->lkey;
+    mem.code_blocks[i].addr = (uintptr_t)*(coding_ptrs + i);
+    mem.code_blocks[i].length = size;*/
+    code_sge[i].lkey = g_ctx->mr->lkey;
+    code_sge[i].addr = (uintptr_t)*(coding_ptrs + i);
+    code_sge[i].length = size;
+  }
+
+  unsigned int cnt = 0;
+
+  /*err_log(g_fd, "tid %d choose ec_ctx %p (cnt1=%u, cnt %u)\n", tid, choose_ctx, g_ctx->cnt1, cnt);*/
+  pthread_mutex_lock(&g_mutex);
+  cnt = g_ctx->cnt1 % 2;
+  choose_ctx = cnt == 0 ? g_ctx->ec_ctx : g_ctx->ec_ctx2;
+  g_ctx->cnt1++;
+  pthread_mutex_unlock(&g_mutex);
+/* 
+  pthread_mutex_lock(&g_mutex);
+  if (g_ctx->cnt1 <= g_ctx->cnt2) {
+    choose_ctx = g_ctx->ec_ctx;
+    err_log(g_fd, "tid %d choose ec_ctx %p cnt1 (cnt1=%u, cnt2 %u)\n", tid, choose_ctx, g_ctx->cnt1, g_ctx->cnt2);
+    g_ctx->cnt1 ++;
+    choose_cnt = &g_ctx->cnt1;
+  } else {
+    choose_ctx = g_ctx->ec_ctx2;
+    err_log(g_fd, "tid %d choose ec_ctx2 %p cnt2 (cnt1=%u, cnt2 %u)\n", tid, choose_ctx, g_ctx->cnt1, g_ctx->cnt2);
+    g_ctx->cnt2 ++;
+    choose_cnt = &g_ctx->cnt2;
+  }
+  pthread_mutex_unlock(&g_mutex);*/
+  /* use the same context for each calculation */
+  /*if (g_ctx->ec_ctx) {
+    update_ec_ctx(g_ctx->ec_ctx, data_ptrs, coding_ptrs);
+  }
+  else {
+  if (!g_ctx->ec_ctx) {
+    g_ctx->ec_ctx = alloc_ec_ctx(g_ctx->pd, &in, data_ptrs, coding_ptrs);
+    if (!g_ctx->ec_ctx) {
+	err_log(g_fd, "Failed to allocate EC context, retreating to old code\n");
+	goto old;
+    }
+  }*/
+
+  /*err = ibv_exp_ec_encode_sync(g_ctx->ec_ctx->calc, &(g_ctx->ec_ctx->mem));*/
+  err = ibv_exp_ec_encode_sync(choose_ctx->calc, &mem);
   if (err)
     err_log(g_fd, "Failed ibv_exp_ec_encode (%d)\n", err);
  
-  err_log(g_fd, "after encode.\n");
-  free_ec_ctx(g_ctx->ec_ctx);
+/*  pthread_mutex_lock(&g_mutex);
+  *choose_cnt = *choose_cnt - 1;
+  err_log(g_fd, "tid %d unlock choose ctx %p cnt1 (cnt1=%u, cnt2 %u)\n", tid, choose_ctx, g_ctx->cnt1, g_ctx->cnt2);
+  pthread_mutex_unlock(&g_mutex);*/
+  /*free(mem.data_blocks);
+  free(mem.code_blocks);*/
   goto close;
 
 old:
@@ -763,7 +909,8 @@ old:
     jerasure_matrix_dotprod(k, w, matrix+(i*k), NULL, k+i, data_ptrs, coding_ptrs, size);
   }
 close:
-  err_log(g_fd, "jerasure_matrix_encode: Out.\n");
+  return;
+  /*err_log(g_fd, "jerasure_matrix_encode: Out.\n");*/
 }
 
 void jerasure_bitmatrix_dotprod(int k, int w, int *bitmatrix_row,
