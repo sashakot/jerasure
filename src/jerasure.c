@@ -369,13 +369,13 @@ typedef enum InitEC_status
   INIT_FAILED
 } InitEC_status;
 
+#define CONTEXT_NUM 32
+
 struct encoder_context {
   struct ibv_context  *context;
   struct ibv_pd       *pd;
-  struct ec_context   *ec_ctx;
-  unsigned int        cnt1;
-  struct ec_context   *ec_ctx2;
-  unsigned int        cnt2;
+  struct ec_context*  ec_ctx[CONTEXT_NUM];
+  unsigned int        cnt;
   /* one global key */
   struct ibv_mr       *mr;
   /* w that device supports */
@@ -623,61 +623,6 @@ void update_ec_ctx(struct ec_context *ctx, char **data_ptrs, char **coding_ptrs)
 
 }
 
-static struct encoder_context *
-init_ctx(struct ibv_device *ib_dev, struct inargs *in, char **data_ptrs, char **code_ptrs)
-{
-    struct encoder_context *ctx;
-
-    ctx = calloc(1, sizeof(*ctx));
-    if (!ctx) {
-        err_log(g_fd, "Failed to allocate encoder context\n");
-        return NULL;
-    }
-
-    ctx->context = ibv_open_device(ib_dev);
-    if (!ctx->context) {
-        err_log(g_fd, "Couldn't get context for %s\n",
-            ibv_get_device_name(ib_dev));
-        goto free_ctx;
-    }
-    ctx->pd = ibv_alloc_pd(ctx->context);
-    if (!ctx->pd) {
-        err_log(g_fd, "Failed to allocate PD\n");
-        goto close_device;
-    }
-    ctx->ec_ctx = alloc_ec_ctx(ctx->pd, in, data_ptrs, code_ptrs);
-    if (!ctx->ec_ctx) {
-        err_log(g_fd, "Failed to allocate EC context\n");
-        goto dealloc_pd;
-    }
-
-    return ctx;
-
-dealloc_pd:
-    ibv_dealloc_pd(ctx->pd);
-close_device:
-    ibv_close_device(ctx->context);
-free_ctx:
-    free(ctx);
-
-    return NULL;
-}
-
-void __attribute__ ((destructor)) fini()
-{
-  if (g_offload_init_status != INIT_SUCCESS)
-    return;
-  free_ec_ctx(g_ctx->ec_ctx);
-  ibv_dealloc_pd(g_ctx->pd);
-
-  if (ibv_close_device(g_ctx->context))
-      err_log(g_fd, "Couldn't release context\n");
-
-  free(g_ctx);
-  err_log(g_fd, "fini: out\n");
-  close(g_fd);
-}
-
 #define ULLONG_MAX 0xFFFFFFFFFFFFFFFF
 void __attribute__ ((constructor)) init()
 {
@@ -776,26 +721,42 @@ void __attribute__ ((constructor)) init()
   alloc_in.w = 8;
   alloc_in.matrix = rs_mat;
 
-  g_ctx->ec_ctx = alloc_ec_ctx2(g_ctx->pd, &alloc_in);
-  if (!g_ctx->ec_ctx) {
-    err_log(g_fd, "Failed to allocate EC context.\n");
-    goto close_device;
+  for (int i = 0; i < CONTEXT_NUM; i++) {
+    g_ctx->ec_ctx[i] = alloc_ec_ctx2(g_ctx->pd, &alloc_in);
+    if (!g_ctx->ec_ctx[i]) {
+      err_log(g_fd, "Failed to allocate EC context for i=%d.\n", i);
+      goto close_device;
+    }
   }
-  g_ctx->cnt1 = 0;
-  g_ctx->ec_ctx2 = alloc_ec_ctx2(g_ctx->pd, &alloc_in);
-  if (!g_ctx->ec_ctx2) {
-    err_log(g_fd, "Failed to allocate EC context 2.\n");
-    goto close_device;
-  }
-  g_ctx->cnt2 = 0;
+  g_ctx->cnt = 0;
   g_offload_init_status = INIT_SUCCESS;
   return;
 
 close_device:
   ibv_close_device(g_ctx->context);
+  /* TBD */
+  /* remove allocated contexes that succeeded */
 free_ctx:
   free(g_ctx);
   g_ctx = NULL;
+}
+
+void __attribute__ ((destructor)) fini()
+{
+  if (g_offload_init_status != INIT_SUCCESS)
+    return;
+  int i;
+  for (i = 0; i < CONTEXT_NUM; i++)
+    free_ec_ctx(g_ctx->ec_ctx[i]);
+
+  ibv_dealloc_pd(g_ctx->pd);
+
+  if (ibv_close_device(g_ctx->context))
+      err_log(g_fd, "Couldn't release context\n");
+
+  free(g_ctx);
+  err_log(g_fd, "fini: out\n");
+  close(g_fd);
 }
 
 pthread_mutex_t g_mutex;
@@ -805,7 +766,6 @@ void jerasure_matrix_encode(int k, int m, int w, int *matrix,
   int err, i;
   /*pid_t tid;*/
   struct ec_context *choose_ctx = NULL;
-  int *choose_cnt = NULL;
 
   /*tid = syscall(SYS_gettid);*/
 
@@ -858,12 +818,12 @@ void jerasure_matrix_encode(int k, int m, int w, int *matrix,
 
   unsigned int cnt = 0;
 
-  /*err_log(g_fd, "tid %d choose ec_ctx %p (cnt1=%u, cnt %u)\n", tid, choose_ctx, g_ctx->cnt1, cnt);*/
   pthread_mutex_lock(&g_mutex);
-  cnt = g_ctx->cnt1 % 2;
-  choose_ctx = cnt == 0 ? g_ctx->ec_ctx : g_ctx->ec_ctx2;
-  g_ctx->cnt1++;
+  cnt = g_ctx->cnt % CONTEXT_NUM;
+  choose_ctx = g_ctx->ec_ctx[cnt];
+  g_ctx->cnt++;
   pthread_mutex_unlock(&g_mutex);
+  /*err_log(g_fd, "tid %d choose ec_ctx %p (g_ctx->cnt=%u, cnt %u)\n", tid, choose_ctx, g_ctx->cnt, cnt);*/
 /* 
   pthread_mutex_lock(&g_mutex);
   if (g_ctx->cnt1 <= g_ctx->cnt2) {
@@ -878,18 +838,6 @@ void jerasure_matrix_encode(int k, int m, int w, int *matrix,
     choose_cnt = &g_ctx->cnt2;
   }
   pthread_mutex_unlock(&g_mutex);*/
-  /* use the same context for each calculation */
-  /*if (g_ctx->ec_ctx) {
-    update_ec_ctx(g_ctx->ec_ctx, data_ptrs, coding_ptrs);
-  }
-  else {
-  if (!g_ctx->ec_ctx) {
-    g_ctx->ec_ctx = alloc_ec_ctx(g_ctx->pd, &in, data_ptrs, coding_ptrs);
-    if (!g_ctx->ec_ctx) {
-	err_log(g_fd, "Failed to allocate EC context, retreating to old code\n");
-	goto old;
-    }
-  }*/
 
   /*err = ibv_exp_ec_encode_sync(g_ctx->ec_ctx->calc, &(g_ctx->ec_ctx->mem));*/
   err = ibv_exp_ec_encode_sync(choose_ctx->calc, &mem);
