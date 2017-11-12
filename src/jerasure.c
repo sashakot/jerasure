@@ -59,6 +59,7 @@
 #include <infiniband/verbs_exp.h>
 #include <sys/syscall.h>
 #include <pthread.h>
+#include "reed_sol.h"
 
 #define talloc(type, num) (type *) malloc(sizeof(type)*(num))
 
@@ -623,11 +624,15 @@ void update_ec_ctx(struct ec_context *ctx, char **data_ptrs, char **coding_ptrs)
 
 }
 
+#define K_ 10 
+#define M_ 2
+#define W_ 8
 #define ULLONG_MAX 0xFFFFFFFFFFFFFFFF
 void __attribute__ ((constructor)) init()
 {
   struct ibv_exp_device_attr dattr;
   int err;
+  int i = 0, j;
 
   char fname[100] ={'\0'};
   pid_t pid, tid;
@@ -636,6 +641,7 @@ void __attribute__ ((constructor)) init()
   tid = syscall(SYS_gettid);
 
   sprintf(fname, "/tmp/debug_ceph.jul_%d_%d", (int)pid, (int)tid);
+  /* for real ceph cluster sprintf(fname, "/var/log/ceph/debug_ceph.jul_%d_%d", (int)pid, (int)tid);*/
 
   g_fd = open(fname, O_RDWR | O_CREAT | O_APPEND , 0666);
   if (g_fd < 0) {
@@ -645,6 +651,8 @@ void __attribute__ ((constructor)) init()
   dprintf(g_fd, "In init.\n");
   g_offload_init_status = INIT_FAILED;
 
+  int res =  galois_init_default_field(W_);
+
   struct ibv_device *device;
   device = find_device(NULL);
   if (!device) {
@@ -652,6 +660,7 @@ void __attribute__ ((constructor)) init()
     assert(0);
   }
   err_log(g_fd, "device %s\n", ibv_get_device_name(device));
+
 
   g_ctx = calloc(1, sizeof(*g_ctx));
   if (!g_ctx) {
@@ -707,21 +716,21 @@ void __attribute__ ((constructor)) init()
     goto close_device;
   }
   /* k=2, m=1, w=8 */
-  int *rs_mat; /*reed_sol_vandermonde_coding_matrix(2, 1, 8);*/
-  rs_mat = talloc(int, 2);
+  int *rs_mat = reed_sol_vandermonde_coding_matrix(K_, M_, W_);
+  /*rs_mat = talloc(int, 2);*/
   if (!rs_mat) {
     err_log(g_fd, "Failed to alloc matrix\n");
     goto close_device;
   }
-  rs_mat[0]=rs_mat[1]=1;
+  /*rs_mat[0]=rs_mat[1]=1;*/
   struct inargs alloc_in = {};
 
-  alloc_in.k = 2;
-  alloc_in.m = 1;
-  alloc_in.w = 8;
+  alloc_in.k = K_;
+  alloc_in.m = M_;
+  alloc_in.w = W_;
   alloc_in.matrix = rs_mat;
 
-  for (int i = 0; i < CONTEXT_NUM; i++) {
+  for (i = 0; i < CONTEXT_NUM; i++) {
     g_ctx->ec_ctx[i] = alloc_ec_ctx2(g_ctx->pd, &alloc_in);
     if (!g_ctx->ec_ctx[i]) {
       err_log(g_fd, "Failed to allocate EC context for i=%d.\n", i);
@@ -734,6 +743,11 @@ void __attribute__ ((constructor)) init()
 
 close_device:
   ibv_close_device(g_ctx->context);
+  for(j = 0; j < i; j++) {
+    err_log(g_fd, "close_device: i = %d, j = %d\n", i, j);
+    fdatasync(g_fd);
+    free_ec_ctx(g_ctx->ec_ctx[i]);
+  }
   /* TBD */
   /* remove allocated contexes that succeeded */
 free_ctx:
@@ -786,8 +800,8 @@ void jerasure_matrix_encode(int k, int m, int w, int *matrix,
   }
 
   struct ibv_exp_ec_mem mem;
-  struct ibv_sge data_sge[2] = {};
-  struct ibv_sge code_sge[1] = {};
+  struct ibv_sge data_sge[K_] = {};
+  struct ibv_sge code_sge[M_] = {};
 
   mem.block_size = size;
 
