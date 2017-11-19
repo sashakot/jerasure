@@ -314,6 +314,71 @@ int *jerasure_matrix_to_bitmatrix(int k, int m, int w, int *matrix)
   return bitmatrix;
 }
 
+#define error printf
+
+/* environment variable utilities */
+int env2int(const char *env_var, int *val, int default_val)
+{
+	long tmp;
+	char *endptr, *str;
+
+	str = getenv(env_var);
+	if (str) {
+		tmp = strtol(str, &endptr, 10);
+		if (*endptr != '\0'|| tmp > INT32_MAX) {
+			error("Invalid %s environment value", env_var);
+			return -1;
+		} else {
+			*val = tmp;
+			return 1;
+		}
+	}
+	*val = default_val;
+	return 0;
+}
+
+int env2bool(const char *env_var, int *val, int default_val)
+{
+	const char *str;
+
+	str = getenv(env_var);
+	if (str) {
+		if (strcmp(str, "YES") == 0 ||
+		    strcmp(str, "yes") == 0 ||
+		    strcmp(str, "TRUE") == 0 ||
+		    strcmp(str, "true") == 0 ||
+		    strcmp(str, "ON") == 0 ||
+		    strcmp(str, "on") == 0 || strcmp(str, "1") == 0) {
+			*val = 1;
+			return 1;
+		}
+		if (strcmp(str, "NO") == 0 ||
+		    strcmp(str, "no") == 0 ||
+		    strcmp(str, "FALSE") == 0 ||
+		    strcmp(str, "false") == 0 ||
+		    strcmp(str, "OFF") == 0 ||
+		    strcmp(str, "off") == 0 || strcmp(str, "0") == 0) {
+			*val = 0;
+			return 1;
+		}
+		error("Invalid %s environment value", env_var);
+		return -1;
+	}
+	*val = default_val;
+	return 0;
+}
+
+int env2str(const char *env_var, const char **val, char *default_val)
+{
+	const char *str;
+	str = getenv(env_var);
+	if (str) {
+		*val = (void *)str;
+		return 1;
+	}
+	return 0;
+}
+
 #define err_log     dprintf
 #define info_log    dprintf
 int g_fd;
@@ -624,10 +689,29 @@ void update_ec_ctx(struct ec_context *ctx, char **data_ptrs, char **coding_ptrs)
 
 }
 
+/*
 #define K_ 10 
 #define M_ 2
 #define W_ 8
+*/
 #define ULLONG_MAX 0xFFFFFFFFFFFFFFFF
+
+
+static const char *ib_dev_name = NULL;
+static int K_ = 10;
+static int M_ = 2;
+static int W_ = 8;
+static int use_offload = 1;
+
+void read_configuration()
+{
+	env2str("MLNX_IB_DEV", &ib_dev_name, NULL);
+	env2int("MLNX_K", &K_, 10);
+	env2int("MLNX_M", &M_, 2);
+	env2int("MLNX_W", &W_, 8);
+	env2bool("MLNX_OFFLOAD", &use_offload, 1);
+}
+
 void __attribute__ ((constructor)) init()
 {
   struct ibv_exp_device_attr dattr;
@@ -639,6 +723,10 @@ void __attribute__ ((constructor)) init()
 
   pid = getpid();
   tid = syscall(SYS_gettid);
+
+  read_configuration();
+  if (!use_offload)
+	  return;
 
   sprintf(fname, "/tmp/debug_ceph.jul_%d_%d", (int)pid, (int)tid);
   /* for real ceph cluster sprintf(fname, "/var/log/ceph/debug_ceph.jul_%d_%d", (int)pid, (int)tid);*/
@@ -654,7 +742,7 @@ void __attribute__ ((constructor)) init()
   int res =  galois_init_default_field(W_);
 
   struct ibv_device *device;
-  device = find_device(NULL);
+  device = find_device(ib_dev_name);
   if (!device) {
     dprintf(g_fd, "ERROR: init didn't find device\n");
     assert(0);
@@ -800,8 +888,8 @@ void jerasure_matrix_encode(int k, int m, int w, int *matrix,
   }
 
   struct ibv_exp_ec_mem mem;
-  struct ibv_sge data_sge[K_] = {};
-  struct ibv_sge code_sge[M_] = {};
+  struct ibv_sge *data_sge = calloc(K_, sizeof(struct ibv_sge));
+  struct ibv_sge *code_sge = calloc(M_, sizeof(struct ibv_sge));
 
   mem.block_size = size;
 
