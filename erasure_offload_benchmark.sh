@@ -13,12 +13,12 @@ PIDSTAT=${PIDSTAT:-"/hpc/local/work/sashakot/sysstat/pidstat"}
 # Runtime parameters
 #
 
-iter=${iter:-1}
+iter=${iter:-10000}
 k=${k:-2}
 m=${m:-1}
-min_kb=${min_kb:-102}
-max_kb=${max_kb:-102}
-step_kb=${step_kb:-2}
+min_kb=${min_kb:-512}
+max_kb=${max_kb:-$[ 10*1024 ]}
+step_kb=${step_kb:-512}
 core=${core:-$[$core_num/2]}
 tmpfile=$(mktemp /tmp/erasure-benchmark-script.XXXXXX)
 ib_dev=${ib_dev:-"mlx5_2"}
@@ -45,6 +45,7 @@ fi
 
 echo "min data size in: $min_kb (KB)"
 echo "max data size in: $max_kb (KB)"
+echo "data size step: $step_kb (KB)"
 echo "ib device: $ib_dev"
 echo "core $core"
 
@@ -58,31 +59,29 @@ function clean
 
 trap clean EXIT
 
-export MLNX_K=$k
-export MLNX_M=$m
-export MLNX_IB_DEV=$ib_dev
-
 function run_test()
 {
 	local bytes=$1
 	local iter=$2
 	local offload=$3
 
+	rm -f ${tmpfile}
+
 	params="-w encode  -P k=$k -P m=$m -P technique=reed_sol_van -s $bytes -i $iter"
-	MLNX_OFFLOAD=$offload ${pidstat}  ${taskset} ${CEPH_ERASURE_BENCHMARK} ${params} > ${tmpfile}
+	MLNX_OFFLOAD=$offload MLNX_K=$k MLNX_M=$m MLNX_IB_DEV=$ib_dev ${pidstat} ${taskset} ${CEPH_ERASURE_BENCHMARK} ${params} > ${tmpfile} 2>/dev/null
 
 	reported_time=$(cat ${tmpfile} | awk ' NF==2 {print $1} ')
 	cpu=$(grep Average ${tmpfile} | awk '{print $8}')
 
-	printf '%.2f,\t\t%.0f\n' $reported_time $cpu
+#	cat ${tmpfile}
+
+	printf '%.2f,\t\t\t%.0f\n' $reported_time $cpu
 }
 
 echo ""
-printf "%s,\t%s,\t%s\n" "Size (KB)" "Time (sec)" "CPU (%)"
+printf "%s,\t%s,\t%s,\t%s,\t%s\n" "Size (KB)" "Baseline time (sec)" "CPU (%)" "Offload time (sec)" "CPU (%)"
 for kb_bytes in $(seq $min_kb $step_kb $max_kb); do
-	rm -f ${tmpfile}
-
 	bytes=$[$kb_bytes*1024]
 
-	printf '%d,\t%s,\t%s\n' $kb_bytes $(run_test $bytes $iter OFF) $(run_test $bytes $iter ON)
+	printf '%d,\t\t%s,\t\t%s\n' $kb_bytes "$(run_test $bytes $iter OFF)" "$(run_test $bytes $iter ON)"
 done
