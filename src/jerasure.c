@@ -876,8 +876,8 @@ void jerasure_matrix_encode(int k, int m, int w, int *matrix,
     assert(0);
   }
 
-  if (g_offload_init_status == INIT_FAILED) {
-    fprintf(stderr, "In jerasure_matrix_encode, INIT_FAILED\n");
+  if (g_offload_init_status != INIT_SUCCESS) {
+    fprintf(stderr, "In jerasure_matrix_encode status %d\n", g_offload_init_status);
     goto old;
   }
 
